@@ -1,0 +1,14 @@
+name: MapImage
+version: '1.0-SNAPSHOT'
+main: com.tommustbe12.mapImage.MapImage
+api-version: '1.20'
+commands:
+  mapimage:
+    description: Turns an image URL into a Minecraft map
+    usage: /mapimage <image-url>
+    permission: mapimage.use
+    permission-message: You don't have permission to use this command.
+permissions:
+  mapimage.use:
+    description: Allows use of /mapimage
+    default: op
