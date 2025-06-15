@@ -31,7 +31,7 @@ public class MapImage extends JavaPlugin implements CommandExecutor {
         saveDefaultConfig();
         config = getConfig();
 
-        // make sure section exists
+        // Ensure maps section exists
         if (!config.isConfigurationSection("maps")) {
             config.createSection("maps");
             saveConfig();
@@ -40,9 +40,19 @@ public class MapImage extends JavaPlugin implements CommandExecutor {
         ConfigurationSection section = config.getConfigurationSection("maps");
         if (section != null) {
             for (String key : section.getKeys(false)) {
-                int mapId = Integer.parseInt(key);
-                String url = section.getString(key);
-                reRenderMap(mapId, url);
+                try {
+                    int mapId = Integer.parseInt(key);
+                    ConfigurationSection entry = section.getConfigurationSection(key);
+                    if (entry == null) continue;
+
+                    String url = entry.getString("url");
+                    int row = entry.getInt("row", 0);
+                    int col = entry.getInt("col", 0);
+                    int totalRows = entry.getInt("totalRows", 1);
+                    int totalCols = entry.getInt("totalCols", 1);
+
+                    reRenderMap(mapId, url, row, col, totalRows, totalCols);
+                } catch (NumberFormatException ignored) {}
             }
         }
     }
@@ -60,55 +70,80 @@ public class MapImage extends JavaPlugin implements CommandExecutor {
         }
 
         if (args.length < 1) {
-            player.sendMessage(ChatColor.RED + "Usage: /mapimage <image-url>");
+            player.sendMessage(ChatColor.RED + "Usage: /mapimage <image-url> [rowsxcols]");
             return true;
         }
 
         String imageUrl = args[0];
+        int rows = 1;
+        int cols = 1;
+
+        if (args.length >= 2 && args[1].matches("\\d+x\\d+")) {
+            String[] parts = args[1].split("x");
+            rows = Integer.parseInt(parts[0]);
+            cols = Integer.parseInt(parts[1]);
+        }
+
+        final int finalRows = rows;
+        final int finalCols = cols;
 
         Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
             try (InputStream in = new URL(imageUrl).openStream()) {
-                BufferedImage image = ImageIO.read(in);
-                if (image == null) {
+                BufferedImage original = ImageIO.read(in);
+                if (original == null) {
                     player.sendMessage(ChatColor.RED + "Failed to load image.");
                     return;
                 }
 
-                BufferedImage scaled = new BufferedImage(128, 128, BufferedImage.TYPE_INT_RGB);
+                BufferedImage scaled = new BufferedImage(finalCols * 128, finalRows * 128, BufferedImage.TYPE_INT_RGB);
                 Graphics2D g = scaled.createGraphics();
-                g.drawImage(image, 0, 0, 128, 128, null);
+                g.drawImage(original, 0, 0, scaled.getWidth(), scaled.getHeight(), null);
                 g.dispose();
 
-                byte[] pixels = new byte[128 * 128];
-                for (int y = 0; y < 128; y++) {
-                    for (int x = 0; x < 128; x++) {
-                        Color color = new Color(scaled.getRGB(x, y));
-                        byte mcColor = MapPalette.matchColor(color);
-                        pixels[y * 128 + x] = mcColor;
+                byte[][] tilePixels = new byte[finalRows * finalCols][128 * 128];
+
+                for (int tileY = 0; tileY < finalRows; tileY++) {
+                    for (int tileX = 0; tileX < finalCols; tileX++) {
+                        BufferedImage tile = scaled.getSubimage(tileX * 128, tileY * 128, 128, 128);
+                        byte[] pixels = new byte[128 * 128];
+                        for (int y = 0; y < 128; y++) {
+                            for (int x = 0; x < 128; x++) {
+                                Color color = new Color(tile.getRGB(x, y));
+                                pixels[y * 128 + x] = MapPalette.matchColor(color);
+                            }
+                        }
+                        tilePixels[tileY * finalCols + tileX] = pixels;
                     }
                 }
 
                 Bukkit.getScheduler().runTask(this, () -> {
-                    MapView mapView = Bukkit.createMap(player.getWorld());
-                    int mapId = mapView.getId();
+                    ConfigurationSection mapSection = config.getConfigurationSection("maps");
+                    if (mapSection == null) {
+                        mapSection = config.createSection("maps");
+                    }
 
-                    // clear renderers
-                    mapView.getRenderers().forEach(mapView::removeRenderer);
+                    for (int i = 0; i < tilePixels.length; i++) {
+                        int row = i / finalCols;
+                        int col = i % finalCols;
 
-                    mapView.addRenderer(new PersistentRenderer(pixels));
+                        MapView mapView = Bukkit.createMap(player.getWorld());
+                        int mapId = mapView.getId();
 
-                    // save config
-                    config.set("maps." + mapId, imageUrl);
+                        mapView.getRenderers().forEach(mapView::removeRenderer);
+                        mapView.addRenderer(new PersistentRenderer(tilePixels[i]));
+
+                        ConfigurationSection entry = config.createSection("maps." + mapId);
+                        entry.set("url", imageUrl);
+                        entry.set("row", row);
+                        entry.set("col", col);
+                        entry.set("totalRows", finalRows);
+                        entry.set("totalCols", finalCols);
+
+                        player.getInventory().addItem(getMapItem(mapView));
+                    }
+
                     saveConfig();
-
-                    // give map
-                    ItemStack mapItem = new ItemStack(Material.FILLED_MAP);
-                    MapMeta meta = (MapMeta) mapItem.getItemMeta();
-                    meta.setMapView(mapView);
-                    mapItem.setItemMeta(meta);
-
-                    player.getInventory().addItem(mapItem);
-                    player.sendMessage(ChatColor.GREEN + "Map created and saved!");
+                    player.sendMessage(ChatColor.GREEN + "Created map image grid: " + finalRows + "x" + finalCols);
                 });
 
             } catch (Exception e) {
@@ -120,23 +155,32 @@ public class MapImage extends JavaPlugin implements CommandExecutor {
         return true;
     }
 
-    private void reRenderMap(int mapId, String url) {
+    private ItemStack getMapItem(MapView mapView) {
+        ItemStack mapItem = new ItemStack(Material.FILLED_MAP);
+        MapMeta meta = (MapMeta) mapItem.getItemMeta();
+        meta.setMapView(mapView);
+        mapItem.setItemMeta(meta);
+        return mapItem;
+    }
+
+    private void reRenderMap(int mapId, String url, int row, int col, int totalRows, int totalCols) {
         Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
             try (InputStream in = new URL(url).openStream()) {
-                BufferedImage image = ImageIO.read(in);
-                if (image == null) return;
+                BufferedImage original = ImageIO.read(in);
+                if (original == null) return;
 
-                BufferedImage scaled = new BufferedImage(128, 128, BufferedImage.TYPE_INT_RGB);
+                BufferedImage scaled = new BufferedImage(totalCols * 128, totalRows * 128, BufferedImage.TYPE_INT_RGB);
                 Graphics2D g = scaled.createGraphics();
-                g.drawImage(image, 0, 0, 128, 128, null);
+                g.drawImage(original, 0, 0, scaled.getWidth(), scaled.getHeight(), null);
                 g.dispose();
+
+                BufferedImage tile = scaled.getSubimage(col * 128, row * 128, 128, 128);
 
                 byte[] pixels = new byte[128 * 128];
                 for (int y = 0; y < 128; y++) {
                     for (int x = 0; x < 128; x++) {
-                        Color color = new Color(scaled.getRGB(x, y));
-                        byte mcColor = MapPalette.matchColor(color);
-                        pixels[y * 128 + x] = mcColor;
+                        Color color = new Color(tile.getRGB(x, y));
+                        pixels[y * 128 + x] = MapPalette.matchColor(color);
                     }
                 }
 
