@@ -3,6 +3,8 @@ package com.tommustbe12.mapImage;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Material;
+import org.bukkit.World;
+import org.bukkit.command.PluginCommand;
 import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.command.Command;
@@ -15,12 +17,15 @@ import org.bukkit.map.MapCanvas;
 import org.bukkit.map.MapView;
 import org.bukkit.map.MapRenderer;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.jetbrains.annotations.NotNull;
 
 import javax.imageio.ImageIO;
 import java.awt.Graphics2D;
 import java.awt.Image;
 import java.awt.image.BufferedImage;
 import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.IOException;
 import java.io.InputStream;
 import java.net.URL;
 import java.util.Arrays;
@@ -45,9 +50,19 @@ public class MapImage extends JavaPlugin implements CommandExecutor {
             ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"
     );
 
+    private static final String[] DISCORD_CDN_URLS = {
+            "media.discordapp.net",
+            "cdn.discordapp.com"
+    };
+
     @Override
     public void onEnable() {
-        this.getCommand("mapimage").setExecutor(this);
+        PluginCommand command = this.getCommand("mapimage");
+        if (command != null) {
+            command.setExecutor(this);
+        } else {
+            throw new RuntimeException("Command 'mapimage' not found in the config!");
+        }
         saveDefaultConfig();
         config = getConfig();
 
@@ -85,14 +100,12 @@ public class MapImage extends JavaPlugin implements CommandExecutor {
                         if ("local".equals(source)) {
                             String fileName = entry.getString("file");
                             if (fileName != null) {
-                                int finalMapId = mapId;
-                                mapQueue.add(() -> reRenderMapFromFile(finalMapId, fileName, row, col, totalRows, totalCols));
+                                mapQueue.add(() -> reRenderMapFromFile(mapId, fileName, row, col, totalRows, totalCols));
                             }
                         } else {
                             String url = entry.getString("url");
                             if (url != null) {
-                                int finalMapId = mapId;
-                                mapQueue.add(() -> reRenderMapAsync(finalMapId, url, row, col, totalRows, totalCols));
+                                mapQueue.add(() -> reRenderMapAsync(mapId, url, row, col, totalRows, totalCols));
                             }
                         }
 
@@ -109,7 +122,7 @@ public class MapImage extends JavaPlugin implements CommandExecutor {
     }
 
     @Override
-    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+    public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command, @NotNull String label, String[] args) {
         if (!(sender instanceof Player player)) {
             sender.sendMessage("Only players can use this command.");
             return true;
@@ -126,6 +139,12 @@ public class MapImage extends JavaPlugin implements CommandExecutor {
         }
 
         String input = args[0];
+
+        if (isDiscordLink(input)) {
+            player.sendMessage(ChatColor.RED + "Image links from discord are not allowed as they expire after a day.");
+            return true;
+        }
+
         int rows = 1, cols = 1;
         if (args.length >= 2 && args[1].matches("\\d+x\\d+")) {
             String[] parts = args[1].split("x");
@@ -210,7 +229,7 @@ public class MapImage extends JavaPlugin implements CommandExecutor {
                 final byte[] tilePixels = pixels;
 
                 mapQueue.add(() -> createMapOnMainThread(
-                        player.getWorld().getName(), url, source, fileName,
+                        player.getWorld(), url, source, fileName,
                         row, col, finalRows, finalCols, tilePixels, player));
             }
         }
@@ -219,11 +238,11 @@ public class MapImage extends JavaPlugin implements CommandExecutor {
         player.sendMessage(ChatColor.GREEN + "Queued map image creation: " + finalRows + "x" + finalCols);
     }
 
-    private void createMapOnMainThread(String worldName, String url, String source, String fileName,
+    private void createMapOnMainThread(World world, String url, String source, String fileName,
                                        int row, int col, int totalRows, int totalCols,
                                        byte[] pixels, Player giver) {
         try {
-            MapView mapView = Bukkit.createMap(Bukkit.getWorld(worldName));
+            MapView mapView = Bukkit.createMap(world);
             int mapId = mapView.getId();
 
             mapView.getRenderers().forEach(mapView::removeRenderer);
@@ -257,6 +276,12 @@ public class MapImage extends JavaPlugin implements CommandExecutor {
 
     private void reRenderMapAsync(int mapId, String url, int row, int col, int totalRows, int totalCols) {
         Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            /*
+            silently skip discord CDN images so that we don't flood the console, since they will NEVER actually resolve.
+            discord CDN links are disallowed anyway, so this is just a proactive fix
+             */
+            if (isDiscordLink(url)) return;
+
             try (InputStream in = new URL(url).openStream()) {
                 BufferedImage original = ImageIO.read(in);
                 if (original == null) return;
@@ -264,7 +289,13 @@ public class MapImage extends JavaPlugin implements CommandExecutor {
                 byte[] pixels = extractTilePixels(original, row, col, totalRows, totalCols);
 
                 mapQueue.add(() -> applyRendererToExistingMap(mapId, pixels));
-            } catch (Exception e) {
+            } catch (IOException e) {
+                if (e instanceof FileNotFoundException) {
+                    // if the image link is returning 404 and therefore the link is not a valid image link any more,
+                    // then don't display the entire stack trace, just log a message at least.
+                    getLogger().log(Level.WARNING, String.format("Map image URL not found at: %s", url));
+                    return;
+                }
                 getLogger().log(Level.WARNING, "Failed to re-download map image: " + url, e);
             }
         });
@@ -355,6 +386,13 @@ public class MapImage extends JavaPlugin implements CommandExecutor {
         return mapItem;
     }
 
+    private boolean isDiscordLink(String url) {
+        for (String discordUrl : DISCORD_CDN_URLS) {
+            if (url.contains(discordUrl)) return true;
+        }
+        return false;
+    }
+
     private static class PersistentRenderer extends MapRenderer {
         private final byte[] pixels;
 
@@ -364,7 +402,7 @@ public class MapImage extends JavaPlugin implements CommandExecutor {
         }
 
         @Override
-        public void render(MapView view, MapCanvas canvas, org.bukkit.entity.Player player) {
+        public void render(@NotNull MapView view, @NotNull MapCanvas canvas, org.bukkit.entity.@NotNull Player player) {
             for (int y = 0; y < TILE_SIZE; y++) {
                 for (int x = 0; x < TILE_SIZE; x++) {
                     canvas.setPixel(x, y, pixels[y * TILE_SIZE + x]);
@@ -373,19 +411,5 @@ public class MapImage extends JavaPlugin implements CommandExecutor {
         }
     }
 
-    private static class MapData {
-        final String url;
-        final int row;
-        final int col;
-        final int totalRows;
-        final int totalCols;
-
-        MapData(String url, int row, int col, int totalRows, int totalCols) {
-            this.url = url;
-            this.row = row;
-            this.col = col;
-            this.totalRows = totalRows;
-            this.totalCols = totalCols;
-        }
-    }
+    private record MapData(String url, int row, int col, int totalRows, int totalCols) { }
 }
